@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>TON Unlocker - Desbloquear Contenido</title>
+    <!-- Cargamos el SDK oficial de TON Connect -->
+    <script src="https://unpkg.com"></script>
+</head>
+<body style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #f4f7f9;">
+
+    <h1>TON Unlocker</h1>
+    
+    <!-- SECCIÓN 1: Conexión y Pago (Visible al inicio) -->
+    <div id="seccion-pago">
+        <p>Conecta tu billetera y paga para desbloquear tus activos</p>
+        <div style="display: flex; justify-content: center;" id="ton-connect-button"></div>
+        <br><br>
+        <button id="btn-pagar" style="display:none; padding: 14px 28px; font-size: 18px; background-color: #0088cc; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold;">
+            Desbloquear por 1 TON
+        </button>
+    </div>
+
+    <!-- SECCIÓN 2: Activos Bloqueados (Oculta hasta que paguen) -->
+    <div id="seccion-activos" style="display: none; max-width: 600px; margin: 30px auto; padding: 20px; background: white; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);">
+        <h2 style="color: #4CAF50;">✅ ¡Activos Desbloqueados con Éxito!</h2>
+        <p>El pago llegó correctamente a la billetera del administrador.</p>
+        <hr style="border: 0; border-top: 1px solid #eee;">
+        
+        <!-- MODIFICA ESTO: Aquí pones los enlaces, archivos o información que vendes -->
+        <div style="text-align: left; padding: 10px;">
+            <h3>📦 Tus Contenidos:</h3>
+            <ul>
+                <li><strong>Activo 1:</strong> <a href="#">Descargar Archivo Seguro 1</a></li>
+                <li><strong>Activo 2:</strong> <a href="#">Ver Enlace Premium</a></li>
+                <li><strong>Clave de Acceso:</strong> <code>TON-SECRET-2026</code></li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // Inicializar TON Connect
+        const tonConnectUI = new TONConnectUI.TonConnectUI({
+            manifestUrl: 'https://ton.org',
+            buttonRootId: 'ton-connect-button'
+        });
+
+        const botonPagar = document.getElementById('btn-pagar');
+        const seccionPago = document.getElementById('seccion-pago');
+        const seccionActivos = document.getElementById('seccion-activos');
+
+        // Controlar visibilidad del botón según la conexión
+        tonConnectUI.onStatusChange(wallet => {
+            if (wallet) {
+                botonPagar.style.display = 'inline-block';
+            } else {
+                botonPagar.style.display = 'none';
+                // Si se desconectan, volvemos a ocultar el contenido por seguridad
+                seccionActivos.style.display = 'none';
+                seccionPago.style.display = 'block';
+            }
+        });
+
+        // Proceso de Pago y Desbloqueo automático
+        botonPagar.addEventListener('click', async () => {
+            const MI_BILLETERA_DESTINO = "UQDROGySoDqyeIaKXnm9Tz4aWGgOUbDBd4h9RD6-R_teW562"; 
+            const cantidadEnNanotons = "1000000000"; // 1 TON
+
+            const transaccion = {
+                validUntil: Math.floor(Date.now() / 1000) + 60,
+                messages: [
+                    {
+                        address: MI_BILLETERA_DESTINO,
+                        amount: cantidadEnNanotons,
+                    }
+                ]
+            };
+
+            try {
+                // El navegador abre la billetera del usuario (ej. Tonkeeper) para que firme
+                const result = await tonConnectUI.sendTransaction(transaccion);
+                
+                if (result.boc) {
+                    // ¡ÉXITO! Modificamos la pantalla automáticamente
+                    seccionPago.style.display = 'none';    // Oculta el botón de pago
+                    seccionActivos.style.display = 'block'; // Muestra el contenido desbloqueado
+                    alert("¡Pago recibido! Tus activos han sido liberados.");
+                }
+            } catch (error) {
+                console.error("Error en la transacción:", error);
+                alert("El pago no se completó. Asegúrate de confirmar la transacción en tu billetera.");
+            }
+        });
+    </script>
+</body>
+</html>
