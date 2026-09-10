@@ -66,6 +66,11 @@ var (
 	headFinalizedBlockGauge = metrics.NewRegisteredGauge("chain/head/finalized", nil)
 	headSafeBlockGauge      = metrics.NewRegisteredGauge("chain/head/safe", nil)
 
+	// Metrics for the ancient store writes performed during snap sync.
+	ancientWriteTimer = metrics.NewRegisteredTimer("chain/ancient/write", nil)
+	ancientSyncTimer  = metrics.NewRegisteredTimer("chain/ancient/sync", nil)
+	ancientBytesMeter = metrics.NewRegisteredMeter("chain/ancient/bytes", nil)
+
 	chainInfoGauge   = metrics.NewRegisteredGaugeInfo("chain/info", nil)
 	chainMgaspsMeter = metrics.NewRegisteredResettingTimer("chain/mgasps", nil)
 
@@ -1505,17 +1510,22 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			}
 		}
 		// Write all chain data to ancients.
+		start := time.Now()
 		writeSize, err := rawdb.WriteAncientBlocks(bc.db, blockChain, receiptChain)
 		if err != nil {
 			log.Error("Error importing chain data to ancients", "err", err)
 			return 0, err
 		}
 		size += writeSize
+		ancientWriteTimer.UpdateSince(start)
+		ancientBytesMeter.Mark(writeSize)
 
 		// Sync the ancient store explicitly to ensure all data has been flushed to disk.
+		start = time.Now()
 		if err := bc.db.SyncAncient(); err != nil {
 			return 0, err
 		}
+		ancientSyncTimer.UpdateSince(start)
 		// Write hash to number mappings
 		batch := bc.db.NewBatch()
 		for _, block := range blockChain {
@@ -1649,18 +1659,26 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// Note all the components of block(hash->number map, header, body, receipts)
 	// should be written atomically. BlockBatch is used for containing all components.
 	var (
-		batch = bc.db.NewBatch()
-		start = time.Now()
+		batch      = bc.db.NewBatch()
+		preimages  = statedb.Preimages()
+		blockWrite = make(chan struct{})
 	)
 	defer batch.Close()
 
-	rawdb.WriteBlock(batch, block)
-	rawdb.WriteReceipts(batch, block.Hash(), block.NumberU64(), receipts)
-	rawdb.WritePreimages(batch, statedb.Preimages())
-	if err := batch.Write(); err != nil {
-		log.Crit("Failed to write block into disk", "err", err)
-	}
-	log.Debug("Committed block data", "size", common.StorageSize(batch.ValueSize()), "elapsed", common.PrettyDuration(time.Since(start)))
+	go func() {
+		start := time.Now()
+		rawdb.WriteBlock(batch, block)
+		rawdb.WriteReceipts(batch, block.Hash(), block.NumberU64(), receipts)
+		rawdb.WritePreimages(batch, preimages)
+		if err := batch.Write(); err != nil {
+			log.Crit("Failed to write block into disk", "err", err)
+		}
+		elapsed := time.Since(start)
+		log.Debug("Committed block data", "size", common.StorageSize(batch.ValueSize()), "elapsed", common.PrettyDuration(elapsed))
+		blockWriteTimer.Update(elapsed)
+		close(blockWrite)
+	}()
+	defer func() { <-blockWrite }()
 
 	var (
 		err          error
@@ -2102,10 +2120,20 @@ type ExecuteConfig struct {
 	EnableWitnessStats bool
 }
 
+// overrideTracerActivation returns the EVM configuration to execute a block with, honoring the
+// caller's tracing intent.
+func (bc *BlockChain) overrideTracerActivation(tracerOn bool) vm.Config {
+	vmConfig := bc.cfg.VmConfig
+	if !tracerOn {
+		vmConfig.Tracer = nil
+	}
+	return vmConfig
+}
+
 // useBALExecution reports whether the block will be executed through the
 // BAL-driven parallel processor.
-func (bc *BlockChain) useBALExecution(block *types.Block, wantWitness bool) bool {
-	return supportsParallelExecution(block, bc.chainConfig, wantWitness, bc.cfg.VmConfig.Tracer != nil, bc.cfg.VmConfig.DisableParallelExecution)
+func (bc *BlockChain) useBALExecution(block *types.Block, vmConfig vm.Config, wantWitness bool) bool {
+	return supportsParallelExecution(block, bc.chainConfig, wantWitness, vmConfig.Tracer != nil, vmConfig.DisableParallelExecution)
 }
 
 // setupExecutionState builds the state instance that block execution reads from
@@ -2120,7 +2148,7 @@ func (bc *BlockChain) useBALExecution(block *types.Block, wantWitness bool) bool
 //     speculative whole-block prefetcher share one cached reader.
 //
 //   - No prefetching: a plain reader, with a no-op cleanup.
-func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.Block, config ExecuteConfig, interrupt *atomic.Bool, execIndex *atomic.Int64) (*state.StateDB, func(*blockProcessingResult), error) {
+func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.Block, vmConfig vm.Config, config ExecuteConfig, interrupt *atomic.Bool, execIndex *atomic.Int64) (*state.StateDB, func(*blockProcessingResult), error) {
 	noop := func(*blockProcessingResult) {}
 
 	var sdb state.Database
@@ -2138,7 +2166,7 @@ func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.B
 	wantWitness := config.StatelessSelfValidation || config.MakeWitness
 
 	switch warmer, ok := sdb.(prewarmReader); {
-	case bc.useBALExecution(block, wantWitness):
+	case bc.useBALExecution(block, vmConfig, wantWitness):
 		base, err := sdb.Reader(parentRoot)
 		if err != nil {
 			return nil, nil, err
@@ -2175,7 +2203,7 @@ func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.B
 		}
 		go func(start time.Time) {
 			// Disable tracing for prefetcher executions.
-			vmCfg := bc.cfg.VmConfig
+			vmCfg := vmConfig
 			vmCfg.Tracer = nil
 			bc.prefetcher.Prefetch(block, throwaway, bc.jumpDestCache, bc.precompileCache.PrefetchView(), vmCfg, interrupt, execIndex)
 
@@ -2213,9 +2241,18 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	defer interrupt.Store(true) // terminate the prefetch at the end
 	execIndex.Store(-1)         // no transaction executed yet
 
+	// Resolve the EVM config for this execution before any component consults
+	// it. The live tracer stored in bc.cfg.VmConfig is a stateful, node-wide
+	// singleton whose hooks are only safe to drive from the chain-insertion
+	// goroutine, so it is attached only when the caller opts in via
+	// EnableTracer. Both the reader topology (setupExecutionState) and the
+	// execution strategy (StateProcessor.Process) key off this resolved
+	// config, keeping the BAL-parallel/sequential decision consistent.
+	vmConfig := bc.overrideTracerActivation(config.EnableTracer)
+
 	// Set up the state reader feeding execution, along with a cleanup to run once
 	// processing is complete (stop the prefetcher, upload reader statistics).
-	statedb, cleanup, err := bc.setupExecutionState(parentRoot, block, config, &interrupt, &execIndex)
+	statedb, cleanup, err := bc.setupExecutionState(parentRoot, block, vmConfig, config, &interrupt, &execIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -2262,7 +2299,7 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	// Process block using the parent state as reference point
 	pstart := time.Now()
 	pctx, _, spanEnd := telemetry.StartSpan(ctx, "bc.processor.Process")
-	res, err := bc.processor.Process(pctx, block, statedb, bc.jumpDestCache, bc.precompileCache, bc.cfg.VmConfig, &execIndex)
+	res, err := bc.processor.Process(pctx, block, statedb, bc.jumpDestCache, bc.precompileCache, vmConfig, &execIndex)
 	spanEnd(&err)
 	if err != nil {
 		bc.reportBadBlock(block, res, err)
@@ -2297,7 +2334,7 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		task := types.NewBlockWithHeader(context).WithBody(*block.Body())
 
 		// Run the stateless self-cross-validation
-		crossStateRoot, crossReceiptRoot, err := ExecuteStateless(ctx, bc.chainConfig, bc.cfg.VmConfig, task, witness)
+		crossStateRoot, crossReceiptRoot, err := ExecuteStateless(ctx, bc.chainConfig, vmConfig, task, witness)
 		if err != nil {
 			return nil, fmt.Errorf("stateless self-validation failed: %v", err)
 		}
@@ -2349,7 +2386,6 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	// Write the block to the chain and get the status.
 	var status WriteStatus
 	if config.WriteState {
-		wstart := time.Now()
 		if !config.WriteHead {
 			// Don't set the head, only insert the block
 			err = bc.writeBlockWithState(block, res.Receipts, statedb)
@@ -2363,7 +2399,6 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		stats.AccountCommits = statedb.AccountCommits  // Account commits are complete, we can mark them
 		stats.StorageCommits = statedb.StorageCommits  // Storage commits are complete, we can mark them
 		stats.DatabaseCommit = statedb.DatabaseCommits // Database commits are complete, we can mark them
-		stats.BlockWrite = time.Since(wstart) - max(statedb.AccountCommits, statedb.StorageCommits) /* concurrent */ - statedb.DatabaseCommits
 	}
 	elapsed := time.Since(startTime) + 1 // prevent zero division
 	stats.TotalTime = elapsed

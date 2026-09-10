@@ -487,23 +487,27 @@ func decodeStorageKey(s string) (h common.Hash, inputLength int, err error) {
 }
 
 // GetHeaderByNumber returns the requested canonical block header.
-//   - When number is -1 the chain pending header is returned.
 //   - When number is -2 the chain latest header is returned.
 //   - When number is -3 the chain finalized header is returned.
 //   - When number is -4 the chain safe header is returned.
+//
+// Per the specification, the result is null for the pending tag and for a
+// safe or finalized tag that cannot be resolved to a block.
 func (api *BlockChainAPI) GetHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (map[string]interface{}, error) {
-	header, err := api.b.HeaderByNumber(ctx, number)
-	if header != nil && err == nil {
-		response := RPCMarshalHeader(header)
-		if number == rpc.PendingBlockNumber {
-			// Pending header need to nil out a few fields
-			for _, field := range []string{"hash", "nonce", "miner"} {
-				response[field] = nil
-			}
-		}
-		return response, err
+	if number == rpc.PendingBlockNumber {
+		return nil, nil
 	}
-	return nil, err
+	header, err := api.b.HeaderByNumber(ctx, number)
+	if err != nil {
+		if number == rpc.SafeBlockNumber || number == rpc.FinalizedBlockNumber {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if header == nil {
+		return nil, nil
+	}
+	return RPCMarshalHeader(header), nil
 }
 
 // GetHeaderByHash returns the requested header by hash.
@@ -1307,13 +1311,25 @@ func (api *BlockChainAPI) Config(ctx context.Context) (*configResponse, error) {
 		}
 	}
 	var (
-		c = api.b.ChainConfig()
-		t = api.b.CurrentHeader().Time
+		c       = api.b.ChainConfig()
+		t       = api.b.CurrentHeader().Time
+		current = c.LatestFork(t)
+		last    = c.LatestFork(^uint64(0))
 	)
+	// The next scheduled fork is not necessarily the next fork enum value:
+	// optional forks (e.g. BPOs) may be left unconfigured, so skip past them
+	// until the first fork with a configured activation time.
+	var next *uint64
+	for f := current + 1; f <= last; f++ {
+		if ts := c.Timestamp(f); ts != nil {
+			next = ts
+			break
+		}
+	}
 	resp := configResponse{
-		Next:    assemble(c, c.Timestamp(c.LatestFork(t)+1)),
-		Current: assemble(c, c.Timestamp(c.LatestFork(t))),
-		Last:    assemble(c, c.Timestamp(c.LatestFork(^uint64(0)))),
+		Current: assemble(c, c.Timestamp(current)),
+		Next:    assemble(c, next),
+		Last:    assemble(c, c.Timestamp(last)),
 	}
 	// Nil out last if no future-fork is configured.
 	if resp.Next == nil {
