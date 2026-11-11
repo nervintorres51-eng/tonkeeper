@@ -335,10 +335,14 @@ func (api *ConsensusAPI) forkchoiceUpdated(ctx context.Context, update engine.Fo
 			log.Info("Skipping beacon update to finalized ancestor", "number", block.NumberU64(), "hash", update.HeadBlockHash)
 			return valid(nil), nil
 		}
-		depth := api.eth.BlockChain().CurrentBlock().Number.Uint64() - block.NumberU64()
-		if api.maxReorgDepth > 0 && depth > api.maxReorgDepth {
-			log.Warn("Refusing too deep reorg", "depth", depth, "head", update.HeadBlockHash)
-			return engine.STATUS_INVALID, engine.TooDeepReorg.With(fmt.Errorf("reorg depth %d exceeds limit %d", depth, api.maxReorgDepth))
+		// A canonical block above the current head (the index outlived a head
+		// rewind, e.g. after an unclean shutdown) is a forward move, not a reorg.
+		if current := api.eth.BlockChain().CurrentBlock().Number.Uint64(); block.NumberU64() < current {
+			depth := current - block.NumberU64()
+			if api.maxReorgDepth > 0 && depth > api.maxReorgDepth {
+				log.Warn("Refusing too deep reorg", "depth", depth, "head", update.HeadBlockHash)
+				return engine.STATUS_INVALID, engine.TooDeepReorg.With(fmt.Errorf("reorg depth %d exceeds limit %d", depth, api.maxReorgDepth))
+			}
 		}
 		if !api.eth.Synced() {
 			log.Info("Ignoring beacon update to old head while syncing", "number", block.NumberU64(), "hash", update.HeadBlockHash)
@@ -914,6 +918,9 @@ func (api *ConsensusAPI) newPayload(ctx context.Context, params engine.Executabl
 	defer spanEnd(&err)
 	api.newPayloadLock.Lock()
 	defer api.newPayloadLock.Unlock()
+
+	// The slow block log reports the time from here to the start of the processing
+	ctx = core.WithPrepareStart(ctx, time.Now())
 
 	log.Trace("Engine API request received", "method", "NewPayload", "number", params.Number, "hash", params.BlockHash)
 	block, err := engine.ExecutableDataToBlock(params, versionedHashes, beaconRoot, requests)

@@ -525,7 +525,7 @@ func newSyncer(db ethdb.KeyValueStore, scheme string) *syncer {
 		peers:    make(map[string]SyncPeer),
 		peerJoin: new(event.Feed),
 		peerDrop: new(event.Feed),
-		rates:    msgrate.NewTrackers(log.New("proto", "snap")),
+		rates:    msgrate.NewTrackers(log.New("proto", "snap"), 0),
 		update:   make(chan struct{}, 1),
 
 		accountIdlers:  make(map[string]struct{}),
@@ -546,7 +546,7 @@ func newSyncer(db ethdb.KeyValueStore, scheme string) *syncer {
 
 		extProgress: new(syncProgress),
 	}
-	s.syncRunner = newSyncRunner(s)
+	s.syncRunner = newSyncRunner(&s.profile, s.update)
 	return s
 }
 
@@ -717,7 +717,7 @@ func (s *syncer) Sync(root common.Hash, cancel chan struct{}) error {
 			s.syncTimeOnce.Do(func() {
 				stateSyncTimeGauge.Update(int64(time.Since(s.startTime)))
 				log.Info("State sync phase is completed", "elapsed", common.PrettyDuration(time.Since(s.startTime)))
-				s.reportProfile()
+				s.profile.report("skippableheals", s.skippableHeals.Load())
 			})
 			if s.healStartTime.IsZero() {
 				s.healStartTime = time.Now()
@@ -2573,7 +2573,11 @@ func (s *syncer) OnAccounts(peer SyncPeer, id uint64, hashes []common.Hash, acco
 	for i, node := range proof {
 		nodes[i] = node
 	}
-	cont, err := trie.VerifyRangeProof(root, req.origin[:], keys, accounts, nodes.Set())
+	firstKey, proofdb := req.origin[:], ethdb.KeyValueReader(nodes.Set())
+	if len(nodes) == 0 && req.origin == (common.Hash{}) {
+		firstKey, proofdb = nil, nil
+	}
+	cont, err := trie.VerifyRangeProof(root, firstKey, keys, accounts, proofdb)
 	if err != nil {
 		logger.Warn("Account range failed proof", "err", err)
 		// Signal this request as failed, and ready for rescheduling
